@@ -1,5 +1,5 @@
 #!/bin/bash
 
-rm -f a
-nvcc -arch=sm_89 -o a hello.cu
-./a
+rm -f hello
+nvcc -g -G -arch=sm_89 -lcublas -o hello hello.cu
+./hello
