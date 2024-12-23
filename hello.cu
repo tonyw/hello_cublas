@@ -5,7 +5,6 @@
 #include <math.h>
 #include <cuda_fp16.h>
 
-// CUDA错误检查的辅助函数
 inline cudaError_t cuda_check(cudaError_t err){
     if(err != cudaSuccess){
         printf("cuda error: %s\n", cudaGetErrorString(err));
@@ -14,8 +13,6 @@ inline cudaError_t cuda_check(cudaError_t err){
     return err;
 }
 
-// 在CPU上初始化矩阵A、B和C
-// a和b分别用行号和列号填充，c初始化为0
 void cpu_init(half *a, half *b, half *c_, size_t N){
     for(size_t c=0;c<N;c++){
         for(size_t r=0;r<N;r++){
@@ -65,45 +62,6 @@ __global__ void check_matrix_multiply_1t1e(half *a, half *b, half *c_gpu, half *
     }
 }
 
-__global__ void check_matrix_multiply_shared_b(half *a, half *b, half *c_gpu, half *epsilon, int *flag, size_t N) {
-    const int TILE_SIZE = 32;
-    __shared__ half As[TILE_SIZE][TILE_SIZE];
-    __shared__ half Bs[TILE_SIZE][TILE_SIZE];
-    
-    int r = blockDim.y * blockIdx.y + threadIdx.y;
-    int c = blockDim.x * blockIdx.x + threadIdx.x;
-    int ty = threadIdx.y;
-    int tx = threadIdx.x;
-    
-    half temp = __float2half(0.0f);
-    
-    if (r < N && c < N) {
-        // 分块计算
-        for (int ph = 0; ph < (N + TILE_SIZE - 1) / TILE_SIZE; ++ph) {
-            if (r < N && ph * TILE_SIZE + tx < N)
-                As[ty][tx] = a[(ph * TILE_SIZE + tx) * N + r];
-            else
-                As[ty][tx] = __float2half(0.0f);
-            if (c < N && ph * TILE_SIZE + ty < N)
-                Bs[ty][tx] = b[c * N + ph * TILE_SIZE + ty];
-            else
-                Bs[ty][tx] = __float2half(0.0f);
-            
-            __syncthreads();
-            
-            // 计算当前tile的部分结果
-            for (int k = 0; k < TILE_SIZE && ph * TILE_SIZE + k < N; ++k) {
-                int a_idx = (ph * TILE_SIZE + k) * N + r;
-                temp = __hadd(temp, __hmul(As[ty][k], Bs[k][tx]));
-            }
-            
-        }
-        if (__habs(temp - c_gpu[r * N + c]) > *epsilon) {
-            flag[r * N + c] = 1;
-        }
-    }
-}
-
 
 bool check_gpu_multiply(half *a, half *b, half *c_gpu, int N){
     const size_t threads_per_block = 32;
@@ -122,7 +80,6 @@ bool check_gpu_multiply(half *a, half *b, half *c_gpu, int N){
     //printf("CPU: Launching kernel...\n");
     
     check_matrix_multiply_1t1e<<<blocks,threads>>>(a, b, c_gpu, EPSILON, flag, N);
-    //check_matrix_multiply_shared_b<<<blocks,threads>>>(a, b, c_gpu, EPSILON, flag, N);
     
     cuda_check(cudaGetLastError());
     cuda_check(cudaDeviceSynchronize());
