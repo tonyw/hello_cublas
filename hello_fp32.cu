@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <assert.h>
 #include <math.h>
-#include <cuda_fp16.h>
 
 inline cudaError_t cuda_check(cudaError_t err){
     if(err != cudaSuccess){
@@ -13,57 +12,48 @@ inline cudaError_t cuda_check(cudaError_t err){
     return err;
 }
 
-void cpu_init(half *a, half *b, half *c_, size_t N){
+void cpu_init(float *a, float *b, float *c_, size_t N){
     for(size_t c=0;c<N;c++){
         for(size_t r=0;r<N;r++){
-            a[c*N+r] = __float2half((float)r / N);
-            b[c*N+r] = __float2half((float)c / N);
-            c_[c*N+r] = __float2half(0.0f);
+            a[c*N+r] = (float)r;
+            b[c*N+r] = (float)c;
+            c_[c*N+r] = 0.0f;
         }
     }
 }
 
 // 将CPU上的矩阵A和B复制到GPU内存
-void gpu_init(half *cpu_a, half *cpu_b, half *gpu_a, half *gpu_b, size_t N){
-    cuda_check(cudaMemcpy(gpu_a, cpu_a, N*N*sizeof(half), cudaMemcpyHostToDevice));
-    cuda_check(cudaMemcpy(gpu_b, cpu_b, N*N*sizeof(half), cudaMemcpyHostToDevice));
+void gpu_init(float *cpu_a, float *cpu_b, float *gpu_a, float *gpu_b, size_t N){
+    cuda_check(cudaMemcpy(gpu_a, cpu_a, N*N*sizeof(float), cudaMemcpyHostToDevice));
+    cuda_check(cudaMemcpy(gpu_b, cpu_b, N*N*sizeof(float), cudaMemcpyHostToDevice));
 }
 
-__global__ void check_matrix_multiply_1t1e(half *a, half *b, half *c_gpu, half *epsilon,int *flag, size_t N){
-    
-    /*
-    tidx.[y,x]: 0,2, cidx.[r,c]: [0, 2],i: 0,a_idx:0,a_data: 0, b_idx:8,b_data: 2
-    tidx.[y,x]: 0,2, cidx.[r,c]: [0, 2],i: 1,a_idx:4,a_data: 0, b_idx:9,b_data: 2
-    tidx.[y,x]: 0,2, cidx.[r,c]: [0, 2],i: 2,a_idx:8,a_data: 0, b_idx:10,b_data: 2
-    tidx.[y,x]: 0,2, cidx.[r,c]: [0, 2],i: 3,a_idx:12,a_data: 0, b_idx:11,b_data: 2
-     */
+__global__ void check_matrix_multiply_1t1e(float *a, float *b, float *c_gpu, float *epsilon, int *flag, size_t N){
     int r_index = blockDim.y * blockIdx.y + threadIdx.y;
     int c_index = blockDim.x * blockIdx.x + threadIdx.x;
     float temp = 0.0f;
     if(r_index < N && c_index < N){
-#pragma unroll
         for(int i = 0; i < N; i++){
             int a_idx = i*(int)N+r_index;
             int b_idx = c_index*(int)N+i;
-            half a_data = (a[a_idx]);
-            half b_data = (b[b_idx]);
-            temp = temp + __half2float(__hmul(a_data,b_data));
-            // if(r_index == 61 && c_index == 17){
-            //     printf("tidx.[y,x]: %d,%d, cidx.[r,c]: [%d, %d],i: %d,a_idx:%d,a_data: %f, b_idx:%d,b_data: %f, temp: %f\n",threadIdx.y, threadIdx.x, r_index, c_index,i, a_idx, __half2float(a[a_idx]), b_idx, __half2float(b[b_idx]), temp);
+            float b_data = b[b_idx];
+            temp += (a[a_idx] * b_data);
+            // if(r_index == 15 && c_index == 11){
+            //     printf("tidx.[y,x]: %d,%d, cidx.[r,c]: [%d, %d],i: %d,a_idx:%d,a_data: %f, b_idx:%d,b_data: %f, temp: %f\n",
+            //         threadIdx.y, threadIdx.x, r_index, c_index, i, a_idx, a[a_idx], b_idx, b_data, temp);
             // }
-            
         }
-        // if(r_index == 61  && c_index == 17){
-        //     printf("temp: %f, gpu_c: %f, diff %f\n", __half2float(temp), __half2float(c_gpu[r_index*N+c_index]),fabsf(temp - __half2float(c_gpu[r_index*N+c_index]))/temp);
+        // if(r_index == 15 && c_index == 11){
+        //     printf("temp: %f, gpu_c: %f\n", temp, c_gpu[r_index*N+c_index]);
         // }
-        if(fabsf(temp - __half2float(c_gpu[r_index*N+c_index]))/temp > __half2float(*epsilon)){
+        if(fabsf(temp - c_gpu[r_index*N+c_index]) > *epsilon){
             flag[r_index*N+c_index] = 1;
         }
     }
 }
 
 
-bool check_gpu_multiply(half *a, half *b, half *c_gpu, int N){
+bool check_gpu_multiply(float *a, float *b, float *c_gpu, int N){
     const size_t threads_per_block = 32;
     const dim3 threads(threads_per_block,threads_per_block);
     //printf("CPU: Before kernel launch\n");
@@ -71,9 +61,9 @@ bool check_gpu_multiply(half *a, half *b, half *c_gpu, int N){
     const dim3 blocks((N+threads.x-1)/threads.x,(N+threads.y-1)/threads.y);   
     //printf("blocks: %d, %d\n", blocks.x, blocks.y);
     
-    half* EPSILON;
-    cuda_check(cudaMallocManaged((void**)&EPSILON, sizeof(half)));
-    *EPSILON = __float2half(0.01f);
+    float* EPSILON;
+    cuda_check(cudaMallocManaged((void**)&EPSILON, sizeof(float)));
+    *EPSILON = 1e-5f;
     int *flag;
     cuda_check(cudaMalloc(&flag, N*N*sizeof(int)));
     cuda_check(cudaMemset(flag, 0, N*N*sizeof(int)));
@@ -135,14 +125,14 @@ const char* cublasGetErrorString(cublasStatus_t status) {
 
 
 // Function to perform matrix multiplication using cuBLAS
-void matrix_multiply_cublas(half *a, half *b, half *c_gpu, size_t N) {
+void matrix_multiply_cublas(float *a, float *b, float *c_gpu, size_t N) {
     cublasHandle_t handle;
     cublasCreate(&handle);
 
-    const half alpha = __float2half(1.0f);
-    const half beta = __float2half(0.0f);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
 
-    cublasStatus_t status = cublasHgemm(
+    cublasStatus_t status = cublasSgemm(
         handle,
         CUBLAS_OP_N,
         CUBLAS_OP_N,
@@ -163,7 +153,7 @@ void matrix_multiply_cublas(half *a, half *b, half *c_gpu, size_t N) {
 }
 
 // 在CPU上分配页锁定内存(pinned memory)
-void allocate_memory_cpu(half **a, half **b, half **c, size_t size) {
+void allocate_memory_cpu(float **a, float **b, float **c, size_t size) {
     cuda_check(cudaMallocHost(a, size));
     cuda_check(cudaMallocHost(b, size));
     cuda_check(cudaMallocHost(c, size));
@@ -174,7 +164,7 @@ void allocate_memory_cpu(half **a, half **b, half **c, size_t size) {
 }
 
 // 在GPU上分配设备内存
-void allocate_memory_gpu(half **a, half **b, half **c, size_t size) {
+void allocate_memory_gpu(float **a, float **b, float **c, size_t size) {
     cuda_check(cudaMalloc(a, size));
     cuda_check(cudaMalloc(b, size));
     cuda_check(cudaMalloc(c, size));
@@ -203,10 +193,10 @@ int main(){
     printf("GPU warp size: %d\n", prop.warpSize);
     printf("GPU maximum threads per block: %d\n", prop.maxThreadsPerBlock);
 
-    const size_t N = 512;
-    half *cpu_a,*cpu_b,*cpu_c;
-    half *gpu_a,*gpu_b,*gpu_c;
-    size_t size = N * N * sizeof(half);
+    const size_t N = 256;
+    float *cpu_a,*cpu_b,*cpu_c;
+    float *gpu_a,*gpu_b,*gpu_c;
+    size_t size = N * N * sizeof(float);
     allocate_memory_gpu(&gpu_a, &gpu_b, &gpu_c, size);
     allocate_memory_cpu(&cpu_a, &cpu_b, &cpu_c, size);
     cpu_init(cpu_a,cpu_b,cpu_c, N);
