@@ -19,10 +19,10 @@ inline cudaError_t cuda_check(cudaError_t err){
 void cpu_init(half *a, half *b, half *c_, size_t N){
     for(size_t c=0;c<N;c++){
         for(size_t r=0;r<N;r++){
-            a[r*N+c] = __float2half((float)r);
-            b[r*N+c] = __float2half((float)c);
-            c_[r*N+c] = __float2half(0.0f);
-            //printf("cpu: %d, %d, %d\n", (int)__half2float(a[r*N+c]), (int)__half2float(b[r*N+c]), (int)__half2float(c_[r*N+c]));
+            a[c*N+r] = __float2half((float)r);
+            b[c*N+r] = __float2half((float)c);
+            c_[c*N+r] = __float2half(0.0f);
+            //printf("[%d,%d]: a:%d, b:%d\n", r,c,(int)__half2float(a[r*N+c]), (int)__half2float(b[r*N+c]));
         }
     }
 }
@@ -34,45 +34,99 @@ void gpu_init(half *cpu_a, half *cpu_b, half *gpu_a, half *gpu_b, size_t N){
 }
 
 __global__ void check_matrix_multiply_1t1e(half *a, half *b, half *c_gpu, half *epsilon,int *flag, size_t N){
-    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
-        printf("GPU check_matrix_multiply_1t1e\n");
-    }
     
-    int c_index = blockDim.y * blockIdx.y + threadIdx.y;
-    int r_index = blockDim.x * blockIdx.x + threadIdx.x;
+    /*
+    tidx.[y,x]: 0,2, cidx.[r,c]: [0, 2],i: 0,a_idx:0,a_data: 0, b_idx:8,b_data: 2
+    tidx.[y,x]: 0,2, cidx.[r,c]: [0, 2],i: 1,a_idx:4,a_data: 0, b_idx:9,b_data: 2
+    tidx.[y,x]: 0,2, cidx.[r,c]: [0, 2],i: 2,a_idx:8,a_data: 0, b_idx:10,b_data: 2
+    tidx.[y,x]: 0,2, cidx.[r,c]: [0, 2],i: 3,a_idx:12,a_data: 0, b_idx:11,b_data: 2
+     */
+    int r_index = blockDim.y * blockIdx.y + threadIdx.y;
+    int c_index = blockDim.x * blockIdx.x + threadIdx.x;
     half temp = 0;
     if(r_index < N && c_index < N){
-        temp = 0;
         for(int i = 0; i < N; i++){
-            temp += (a[r_index*N+i] * b[i*N+c_index]);
+            int a_idx = i*(int)N+r_index;
+            int b_idx = c_index*(int)N+i;
+            half a_data = a[a_idx];
+            half b_data = b[b_idx];
+            temp = __hadd(temp, __hmul(a_data, b_data));
+            if(r_index == 15 && c_index == 11){
+                printf("tidx.[y,x]: %d,%d, cidx.[r,c]: [%d, %d],i: %d,a_idx:%d,a_data: %d, b_idx:%d,b_data: %d, temp: %f.05\n",threadIdx.y, threadIdx.x, r_index, c_index,i, a_idx, (int)__half2float(a[a_idx]), b_idx, (int)__half2float(b_data), __half2float(temp));
+            }
             
         }
-        printf("temp: %d, c_gpu[%d]: %d, epsilon: %f.2\n", (int)__half2float(temp), r_index*N+c_index,(int)__half2float(c_gpu[r_index*N+c_index]),__half2float(*epsilon));
+        if(r_index == 15 && c_index == 11){
+            printf("temp: %f.05, gpu_c: %f.05\n", __half2float(temp), __half2float(c_gpu[r_index*N+c_index]));
+        }
         if(__habs(temp - c_gpu[r_index*N+c_index]) > *epsilon){
             flag[r_index*N+c_index] = 1;
         }
     }
 }
 
+__global__ void check_matrix_multiply_shared_b(half *a, half *b, half *c_gpu, half *epsilon, int *flag, size_t N) {
+    const int TILE_SIZE = 32;
+    __shared__ half As[TILE_SIZE][TILE_SIZE];
+    __shared__ half Bs[TILE_SIZE][TILE_SIZE];
+    
+    int r = blockDim.y * blockIdx.y + threadIdx.y;
+    int c = blockDim.x * blockIdx.x + threadIdx.x;
+    int ty = threadIdx.y;
+    int tx = threadIdx.x;
+    
+    half temp = __float2half(0.0f);
+    
+    if (r < N && c < N) {
+        // 分块计算
+        for (int ph = 0; ph < (N + TILE_SIZE - 1) / TILE_SIZE; ++ph) {
+            if (r < N && ph * TILE_SIZE + tx < N)
+                As[ty][tx] = a[(ph * TILE_SIZE + tx) * N + r];
+            else
+                As[ty][tx] = __float2half(0.0f);
+            if (c < N && ph * TILE_SIZE + ty < N)
+                Bs[ty][tx] = b[c * N + ph * TILE_SIZE + ty];
+            else
+                Bs[ty][tx] = __float2half(0.0f);
+            
+            __syncthreads();
+            
+            // 计算当前tile的部分结果
+            for (int k = 0; k < TILE_SIZE && ph * TILE_SIZE + k < N; ++k) {
+                int a_idx = (ph * TILE_SIZE + k) * N + r;
+                temp = __hadd(temp, __hmul(As[ty][k], Bs[k][tx]));
+            }
+            
+        }
+        if (__habs(temp - c_gpu[r * N + c]) > *epsilon) {
+            flag[r * N + c] = 1;
+        }
+    }
+}
+
+
 bool check_gpu_multiply(half *a, half *b, half *c_gpu, int N){
     const size_t threads_per_block = 32;
     const dim3 threads(threads_per_block,threads_per_block);
-    printf("CPU: Before kernel launch\n");
-    printf("threads: %d, %d\n", threads.x, threads.y);
+    //printf("CPU: Before kernel launch\n");
+    //printf("threads: %d, %d\n", threads.x, threads.y);
     const dim3 blocks((N+threads.x-1)/threads.x,(N+threads.y-1)/threads.y);   
-    printf("blocks: %d, %d\n", blocks.x, blocks.y);
+    //printf("blocks: %d, %d\n", blocks.x, blocks.y);
     
-    half EPSILON = __float2half(1e-5f);
+    half* EPSILON;
+    cuda_check(cudaMallocManaged((void**)&EPSILON, sizeof(half)));
+    *EPSILON = __float2half(1e-5f);
     int *flag;
     cuda_check(cudaMalloc(&flag, N*N*sizeof(int)));
     cuda_check(cudaMemset(flag, 0, N*N*sizeof(int)));
-    printf("CPU: Launching kernel...\n");
+    //printf("CPU: Launching kernel...\n");
     
-    check_matrix_multiply_1t1e<<<blocks,threads>>>(a, b, c_gpu, &EPSILON, flag, N);
+    check_matrix_multiply_1t1e<<<blocks,threads>>>(a, b, c_gpu, EPSILON, flag, N);
+    //check_matrix_multiply_shared_b<<<blocks,threads>>>(a, b, c_gpu, EPSILON, flag, N);
     
     cuda_check(cudaGetLastError());
     cuda_check(cudaDeviceSynchronize());
-    printf("CPU: After kernel execution\n");
+    //printf("CPU: After kernel execution\n");
     
     int *flag_host = (int*)malloc(N*N*sizeof(int));
     cuda_check(cudaMemcpy(flag_host, flag, N*N*sizeof(int), cudaMemcpyDeviceToHost));
@@ -85,9 +139,12 @@ bool check_gpu_multiply(half *a, half *b, half *c_gpu, int N){
         }
     }
     cuda_check(cudaFree(flag));
+    cuda_check(cudaFree(EPSILON));
     free(flag_host);
     return true;
 }
+
+
 
 
 
@@ -130,8 +187,8 @@ void matrix_multiply_cublas(half *a, half *b, half *c_gpu, size_t N) {
 
     cublasStatus_t status = cublasHgemm(
         handle,
-        CUBLAS_OP_T,
-        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
         N, N, N,
         &alpha,
         a, N,
@@ -189,7 +246,7 @@ int main(){
     printf("GPU warp size: %d\n", prop.warpSize);
     printf("GPU maximum threads per block: %d\n", prop.maxThreadsPerBlock);
 
-    const size_t N = 4;
+    const size_t N = 16;
     half *cpu_a,*cpu_b,*cpu_c;
     half *gpu_a,*gpu_b,*gpu_c;
     size_t size = N * N * sizeof(half);
@@ -207,6 +264,7 @@ int main(){
     //warm up
     for(int i = 0;i < 3;i++){
         matrix_multiply_cublas(gpu_a, gpu_b, gpu_c, N);
+        cuda_check(cudaDeviceSynchronize());
     }
     
     for(int i = 0; i < 10; i++){
@@ -216,6 +274,7 @@ int main(){
         cudaEventRecord(start, 0);
 
         matrix_multiply_cublas(gpu_a, gpu_b, gpu_c, N);
+        //check_gpu_multiply(gpu_a, gpu_b, gpu_c, N);
         cudaEventRecord(end, 0);
 		cudaEventSynchronize(end);
 		cudaEventElapsedTime(&ms, start, end);
